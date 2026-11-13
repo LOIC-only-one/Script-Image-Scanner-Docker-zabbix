@@ -1,27 +1,94 @@
-# Configuration Zabbix pour le Scanner de Vulnérabilités
+# Scanner de vulnérabilités Docker → Zabbix
 
-## Vue d'ensemble
+**Scanne chaque heure les images de tous les conteneurs en cours d'exécution avec Trivy et remonte le nombre de failles par sévérité dans Zabbix, pour alerter dès qu'une CVE critique apparaît.**
 
-Le scanner de vulnérabilités analyse automatiquement tous les conteneurs Docker de votre infrastructure et envoie les résultats à Zabbix. Il utilise Trivy pour détecter les vulnérabilités dans les images Docker.
+![Python](https://img.shields.io/badge/Python-3-3776AB?style=flat-square&logo=python&logoColor=white)
+![Trivy](https://img.shields.io/badge/Trivy-scan%20CVE-1904DA?style=flat-square&logo=aqua&logoColor=white)
+![Zabbix](https://img.shields.io/badge/Zabbix-trapper-D40000?style=flat-square&logo=zabbix&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Alpine-2496ED?style=flat-square&logo=docker&logoColor=white)
+
+Les images d'une infrastructure vieillissent : une image saine le jour du déploiement accumule des CVE au fil des mois. Ce conteneur fait le tour des images en service, les passe dans Trivy et transforme le résultat en métriques Zabbix : historique, graphiques et déclencheurs d'alerte, dans l'outil de supervision déjà en place.
+
+---
 
 ## Fonctionnement
 
-- **Scan automatique** : Le scanner s'exécute toutes les heures (configurable via `SCAN_INTERVAL`)
-- **Analyse Trivy** : Scan de sécurité des images Docker
-- **Envoi à Zabbix** : Les métriques sont envoyées via `zabbix_sender`
+```mermaid
+flowchart LR
+    subgraph H["Hôte Docker"]
+        D[(docker.sock)]
+        C1[conteneur A]
+        C2[conteneur B]
+        S[vulnerability-scanner<br/>scan_loop.sh → scanner.py]
+    end
+    S -->|docker ps| D
+    S -->|trivy image| T[Trivy<br/>base CVE]
+    T -->|JSON| S
+    S -->|zabbix_sender<br/>port 10051| Z[Zabbix server<br/>hôte « vulnerability-scanner »]
+    Z --> G[Graphiques]
+    Z --> A[Déclencheurs<br/>CRITICAL / HIGH]
+```
 
-## Métriques envoyées à Zabbix
+1. `scan_loop.sh` lance `scanner.py` toutes les `SCAN_INTERVAL` secondes (1 h par défaut).
+2. `scanner.py` liste les conteneurs via le socket Docker (en ignorant le sien) et scanne chaque image **une seule fois**, même si plusieurs conteneurs l'utilisent.
+3. Les vulnérabilités sont comptées par sévérité et additionnées pour toute l'infrastructure.
+4. Les totaux partent vers Zabbix en mode **trapper** (aucun agent ni interface à configurer côté hôte).
 
-Le scanner envoie les métriques suivantes avec le hostname `vulnerability-scanner` :
+## Métriques envoyées
 
-| Clé Zabbix | Description |
-|------------|-------------|
-| `vuln.critical` | Nombre de vulnérabilités critiques |
-| `vuln.high` | Nombre de vulnérabilités de haute sévérité |
-| `vuln.medium` | Nombre de vulnérabilités de moyenne sévérité |
-| `vuln.low` | Nombre de vulnérabilités de faible sévérité |
-| `vuln.total` | Nombre total de vulnérabilités |
-| `vuln.containers.scanned` | Nombre de conteneurs scannés |
+| Clé Zabbix | Valeur |
+|---|---|
+| `vuln.critical` | Vulnérabilités CRITICAL (toutes images) |
+| `vuln.high` | Vulnérabilités HIGH |
+| `vuln.medium` | Vulnérabilités MEDIUM |
+| `vuln.low` | Vulnérabilités LOW |
+| `vuln.total` | Total, toutes sévérités |
+| `vuln.containers.scanned` | Nombre d'images distinctes scannées |
+
+---
+
+## Démarrage rapide
+
+```bash
+git clone https://github.com/LOIC-only-one/Script-Image-Scanner-Docker-zabbix.git
+cd Script-Image-Scanner-Docker-zabbix
+docker build -t vulnerability-scanner .
+
+docker run -d --name vulnerability-scanner \
+  -v /var/run/docker.sock:/var/run/docker.sock:ro \
+  -e ZABBIX_SERVER=<ip-du-serveur-zabbix> \
+  vulnerability-scanner
+
+docker logs -f vulnerability-scanner
+```
+
+Ou dans un `docker-compose.yml` existant :
+
+```yaml
+services:
+  vulnerability-scanner:
+    build: ./Script-Image-Scanner-Docker-zabbix
+    container_name: vulnerability-scanner   # ce nom est exclu du scan
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      ZABBIX_SERVER: zabbix-server
+      SCAN_INTERVAL: 3600
+```
+
+> Le socket Docker donne un accès étendu à l'hôte : à monter en lecture seule et à réserver à un conteneur de confiance.
+
+## Variables d'environnement
+
+| Variable | Défaut | Rôle |
+|---|---|---|
+| `ZABBIX_SERVER` | `172.23.0.20` | Adresse du serveur Zabbix |
+| `ZABBIX_PORT` | `10051` | Port trapper |
+| `SCANNER_HOSTNAME` | `vulnerability-scanner` | Nom de l'hôte dans Zabbix |
+| `SCAN_INTERVAL` | `3600` | Secondes entre deux scans |
+
+---
 
 ## Configuration dans Zabbix (à faire manuellement)
 
@@ -163,27 +230,6 @@ CMD ["/scanner/scan_loop.sh"]
 - **Items** :
   - `vuln.total`
 
-## Démarrage du scanner
-
-```bash
-cd <dir>
-
-# Construire et démarrer le scanner
-docker compose -f docker-compose.services.yaml up -d vulnerability-scanner
-
-# Voir les logs
-docker logs -f vulnerability-scanner
-```
-
-## Variables d'environnement
-
-Vous pouvez personnaliser le scanner dans `docker-compose.services.yaml` :
-
-- `ZABBIX_SERVER` : Adresse du serveur Zabbix (défaut: 172.23.0.20)
-- `ZABBIX_PORT` : Port du serveur Zabbix (défaut: 10051)
-- `SCANNER_HOSTNAME` : Nom d'hôte pour Zabbix (défaut: vulnerability-scanner)
-- `SCAN_INTERVAL` : Intervalle entre les scans en secondes (défaut: 3600 = 1 heure)
-
 ## Tests
 
 Pour forcer un scan immédiat :
@@ -224,3 +270,7 @@ docker inspect vulnerability-scanner | grep docker.sock
 
 ### Trivy prend trop de temps
 Les premiers scans peuvent être longs car Trivy télécharge sa base de données de vulnérabilités. Les scans suivants seront plus rapides.
+
+---
+
+Projet de [Loïc Maurer](https://github.com/LOIC-only-one) · Supervision & sécurité
